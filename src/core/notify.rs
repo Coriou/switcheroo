@@ -1,11 +1,12 @@
-//! Desktop notifications through the OS notification center: notify-rust drives XDG/D-Bus on
-//! Linux, WinRT toasts on Windows and the macOS notification center. Fire-and-forget: a
-//! failure is logged and never bubbles up, and the call runs on its own thread so callers on
-//! the tray's main thread or an HTTP handler are never blocked.
+//! Desktop notifications through the OS notification center. Fire-and-forget: a failure is
+//! logged and never bubbles up, and the call runs on its own thread so callers on the tray's
+//! main thread or an HTTP handler are never blocked.
 //!
-//! macOS caveat: only app bundles own a notification identity. As a bare binary, Switcheroo's
-//! notices are delivered through the Terminal's identity (its icon and name appear); a proper
-//! `Switcheroo.app` bundle would fix that.
+//! Windows (WinRT toasts) and Linux (XDG over D-Bus) go through notify-rust. macOS does not:
+//! only app bundles own a notification identity, and on macOS 26 the legacy API a bare binary
+//! could use no longer displays anything. `osascript`'s `display notification` is delivered
+//! (under Script Editor's identity), so that is the macOS path until Switcheroo ships as a
+//! `.app` bundle.
 
 use std::thread;
 
@@ -14,11 +15,27 @@ pub const APP_NAME: &str = "Switcheroo";
 pub fn notify(title: impl Into<String>, body: impl Into<String>) {
     let (title, body) = (title.into(), body.into());
     thread::spawn(move || {
-        let result = notify_rust::Notification::new().appname(APP_NAME).summary(&title).body(&body).show();
-        if let Err(e) = result {
+        if let Err(e) = deliver(&title, &body) {
             log::warn!("desktop notification failed: {e}");
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+fn deliver(title: &str, body: &str) -> anyhow::Result<()> {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title));
+    let out = std::process::Command::new("osascript").args(["-e", &script]).output()?;
+    if !out.status.success() {
+        anyhow::bail!("osascript: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn deliver(title: &str, body: &str) -> anyhow::Result<()> {
+    notify_rust::Notification::new().appname(APP_NAME).summary(title).body(body).show()?;
+    Ok(())
 }
 
 /// "Claude Code · Switched to Work (alex@acme.dev)".

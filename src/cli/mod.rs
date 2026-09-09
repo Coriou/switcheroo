@@ -141,6 +141,9 @@ pub enum Command {
     },
     /// Print shell completions.
     Completions { shell: clap_complete::Shell },
+    /// Send a desktop notification (for checking that notifications reach you).
+    #[command(hide = true)]
+    Notify { title: String, body: String },
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -401,6 +404,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     println!("The tray starts at your next login. Run `switcheroo tray` to start it now.");
                 }
             }
+        }
+        Command::Notify { title, body } => {
+            crate::core::notify::notify(title, body);
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            println!("Notification sent.");
         }
         Command::Completions { .. } => unreachable!(),
     }
