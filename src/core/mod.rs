@@ -8,6 +8,7 @@ pub mod cx;
 pub mod fsutil;
 pub mod lock;
 pub mod model;
+pub mod notify;
 pub mod proc;
 pub mod settings;
 pub mod state;

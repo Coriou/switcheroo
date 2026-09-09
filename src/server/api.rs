@@ -97,7 +97,13 @@ pub struct UseBody {
 }
 
 pub async fn use_account(State(st): State<AppState>, Path(id): Path<String>, Json(body): Json<UseBody>) -> ApiResult {
-    blocking(st.core, move |c| c.use_account(&id, &body.account)).await
+    blocking(st.core, move |c| {
+        let out = c.use_account(&id, &body.account)?;
+        let name = c.provider(&id).map(|p| p.meta().name).unwrap_or("Switcheroo");
+        crate::core::notify::switched(name, &out.account.label, &out.account.id);
+        Ok(out)
+    })
+    .await
 }
 
 pub async fn login(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult {
@@ -177,6 +183,7 @@ pub async fn install_update(State(st): State<AppState>) -> ApiResult {
         .map_err(|e| ApiError(anyhow::anyhow!("task failed: {e}")))?;
     match result {
         Ok(installed) => {
+            crate::core::notify::updated(&installed.version);
             let server_file = st.core.dirs.server_file();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(800));

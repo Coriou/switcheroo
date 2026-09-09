@@ -123,6 +123,7 @@ fn run_loop(
 
     let mut tray: Option<TrayIcon> = None;
     let mut last_error: Option<String> = None;
+    let mut announced_update: Option<String> = None;
     let mut computing = false;
     let mut dirty_while_computing = false;
     let proxy = event_loop.create_proxy();
@@ -158,6 +159,12 @@ fn run_loop(
             }
             Event::UserEvent(UserEvent::Statuses { providers, autostart, usage, update }) => {
                 computing = false;
+                if let Some(u) = &update
+                    && announced_update.as_deref() != Some(&u.latest)
+                {
+                    crate::core::notify::update_available(&u.latest);
+                    announced_update = Some(u.latest.clone());
+                }
                 let settings = core.settings.read().map(|s| s.clone()).unwrap_or_default();
                 let menu =
                     menu::build(&providers, &settings, autostart, &usage, update.as_ref(), last_error.as_deref());
@@ -210,9 +217,13 @@ fn run_loop(
                                 {
                                     log::warn!("{}: {}", provider, w.message);
                                 }
+                                let name = core.provider(&provider).map(|p| p.meta().name).unwrap_or("Switcheroo");
+                                crate::core::notify::switched(name, &out.account.label, &out.account.id);
                                 let _ = proxy.send_event(UserEvent::Dirty);
                             }
                             Err(e) => {
+                                let name = core.provider(&provider).map(|p| p.meta().name).unwrap_or("Switcheroo");
+                                crate::core::notify::notify(name, format!("Switch failed: {e:#}"));
                                 let _ = proxy.send_event(UserEvent::Error(format!("{provider}: {e:#}")));
                             }
                         });
@@ -250,8 +261,10 @@ fn run_loop(
                         let proxy = proxy.clone();
                         let server_file = core.dirs.server_file();
                         std::thread::spawn(move || match core.install_update() {
-                            Ok(_) => {
+                            Ok(installed) => {
+                                crate::core::notify::updated(&installed.version);
                                 let _ = crate::core::fsutil::remove_opt(&server_file);
+                                std::thread::sleep(Duration::from_millis(600));
                                 crate::core::update::relaunch();
                             }
                             Err(e) => {
