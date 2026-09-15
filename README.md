@@ -43,10 +43,14 @@ cargo build --release          # → target/release/switcheroo
 
 ## Usage
 #### **On your laptop**
-Run `switcheroo tray` once; it detaches and keeps running in the background (`switcheroo tray --stop` ends it): a menu-bar item with one submenu per CLI, click an account to switch. `switcheroo autostart enable` (or the "Start at login" toggle) opens it when you sign in to the machine, and "Open Switcheroo…" gets you the full web UI for renaming, forgetting, settings and diagnostics.
+**`switcheroo tray`**
+
+Starts a menu-bar item with one submenu per CLI, click an account to switch. "Open Switcheroo…" opens the full web UI for renaming, forgetting, settings and diagnostics.
 
 #### **On a remote server**
-No display needed: `switcheroo serve` runs the web UI on loopback, and an SSH tunnel (`ssh -L 20123:127.0.0.1:20123 host`, using the port it prints) puts it in your local browser.
+**`switcheroo serve`**
+
+It starts the web UI on loopback, and an SSH tunnel (`ssh -L 20123:127.0.0.1:20123 host`, using the port it prints) puts it in your local browser.
 
 #### **Prefer the terminal?**
 Everything is a `switcheroo` subcommand with `--json` output, so it scripts well: `switcheroo --help` or the Reference page lists them all.
