@@ -239,6 +239,7 @@ pub fn provider() -> Box<dyn Provider> {
         }),
         extra_preflight: Some(preflight),
         usage: Some(usage),
+        import_login: None,
     })
 }
 
