@@ -427,7 +427,6 @@ impl Core {
             );
         }
 
-        // An isolated import, when a provider has one, returns before this check.
         self.refuse_blocked(p)?;
         let code = self.cx.run_interactive(&argv).with_context(|| format!("running {}", argv.join(" ")))?;
         if code != 0 {
