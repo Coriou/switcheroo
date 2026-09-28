@@ -291,11 +291,13 @@ impl Core {
                 if let Some(prev) = &previous {
                     match &prev.identity {
                         Some(ident) => {
-                            let key = vault_key(meta.id, &ident.id);
-                            self.vault
-                                .put(&key, &format!("{} {}", meta.name, ident.label), &prev.secret)
-                                .context("re-saving the current login")?;
+                            // The vault copy is what activate installs. Putting the live file
+                            // back under the same id would replace that saved secret.
                             if ident.id != target.id {
+                                let key = vault_key(meta.id, &ident.id);
+                                self.vault
+                                    .put(&key, &format!("{} {}", meta.name, ident.label), &prev.secret)
+                                    .context("re-saving the current login")?;
                                 recaptured = Some(ident.clone());
                             }
                         }
@@ -706,6 +708,57 @@ mod tests {
         assert_eq!(slot["token"], "t-b");
         assert_eq!(slot["user"], "b@x.io");
         assert!(core.vault.get("mock:a@x.io").unwrap().is_none());
+    }
+
+    #[test]
+    fn use_of_imported_same_identity_keeps_the_saved_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = json_file_provider();
+        provider.import_login = Some(|_cx| Ok(br#"{"token":"t-new","user":"a@x.io","theme":"dark"}"#.to_vec()));
+        let core = Core::open(CoreOpts {
+            data_dir: Some(dir.path().join("data")),
+            vault: Some(VaultChoice::File),
+            cx: Some(Cx::test(dir.path(), Os::Linux)),
+            providers: Some(vec![Box::new(provider)]),
+        })
+        .unwrap();
+        core.detect_cache.lock().unwrap().insert("mock", Some(Installed { path: "/bin/mock".into(), version: None }));
+
+        let file = dir.path().join("mock.json");
+        std::fs::write(&file, r#"{"token":"t-old","user":"a@x.io","theme":"dark"}"#).unwrap();
+
+        let saved = core.login_here("mock", None).unwrap();
+        assert_eq!(saved.account.id, "a@x.io");
+        let live: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(live["token"], "t-old");
+        assert_eq!(live["theme"], "dark");
+
+        let blob = core.vault.get("mock:a@x.io").unwrap().expect("vault holds the imported login");
+        let stored: serde_json::Value = serde_json::from_slice(blob.as_bytes()).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD.decode(stored["slots"][0].as_str().unwrap()).unwrap();
+        let slot: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(slot["token"], "t-new");
+        assert_eq!(slot["user"], "a@x.io");
+
+        core.use_account("mock", "a@x.io").unwrap();
+        let live: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(live["token"], "t-new");
+        assert_eq!(live["user"], "a@x.io");
+        assert_eq!(live["theme"], "dark");
+        let blob = core.vault.get("mock:a@x.io").unwrap().expect("vault still holds the imported login");
+        let stored: serde_json::Value = serde_json::from_slice(blob.as_bytes()).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD.decode(stored["slots"][0].as_str().unwrap()).unwrap();
+        let slot: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(slot["token"], "t-new");
+
+        core.use_account("mock", "a@x.io").unwrap();
+        let live: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(live["token"], "t-new");
+        let blob = core.vault.get("mock:a@x.io").unwrap().expect("vault still holds the imported login");
+        let stored: serde_json::Value = serde_json::from_slice(blob.as_bytes()).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD.decode(stored["slots"][0].as_str().unwrap()).unwrap();
+        let slot: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(slot["token"], "t-new");
     }
 
     #[test]
