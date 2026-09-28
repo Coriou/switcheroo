@@ -160,7 +160,7 @@ impl Core {
             Strategy::SlotSwap => {
                 let captured = p.capture(&self.cx)?.ok_or_else(|| OpError::NothingLoggedIn(meta.name.to_string()))?;
                 let identity = saved_identity(meta, captured.identity, captured.identity_error, &label)?;
-                self.store_account(p, identity, &captured.secret, label)
+                self.store_account(p, identity, &captured.secret, label, false)
             }
         }
     }
@@ -171,12 +171,18 @@ impl Core {
         identity: Identity,
         secret: &SecretBlob,
         label: Option<String>,
+        install_saved: bool,
     ) -> Result<Account> {
         let meta = p.meta();
         let key = vault_key(meta.id, &identity.id);
         let vault_label = label.clone().unwrap_or_else(|| identity.label.clone());
         self.vault.put(&key, &format!("{} {}", meta.name, vault_label), secret).context("storing the credential")?;
         let mut st = self.state();
+        if install_saved {
+            st.install_saved.insert(key.clone());
+        } else {
+            st.install_saved.remove(&key);
+        }
         let acct = st.upsert(
             Account {
                 provider: meta.id.to_string(),
@@ -263,7 +269,9 @@ impl Core {
         Ok(warnings)
     }
 
-    /// Switch the live login. Re-captures whatever is live first, then activates, then verifies.
+    /// Switch the live login, then verify. A different live account is re-saved first.
+    /// The same account installs the saved secret when an import marked it, and otherwise
+    /// keeps a newer live file for that id.
     pub fn use_account(&self, provider_id: &str, query: &str) -> Result<SwitchOutcome> {
         let p = self.provider(provider_id)?;
         let _lock = self.lock()?;
@@ -287,18 +295,32 @@ impl Core {
                 let secret = self.vault.get(&target.vault_key())?.ok_or_else(|| {
                     anyhow!("no saved credential for {} ({}); save it again", target.label, meta.name)
                 })?;
+                let mut install = secret;
                 let previous = p.capture(&self.cx).context("reading the current login")?;
                 if let Some(prev) = &previous {
                     match &prev.identity {
-                        Some(ident) => {
-                            // The vault copy is what activate installs. Putting the live file
-                            // back under the same id would replace that saved secret.
-                            if ident.id != target.id {
-                                let key = vault_key(meta.id, &ident.id);
+                        Some(ident) if ident.id != target.id => {
+                            let key = vault_key(meta.id, &ident.id);
+                            self.vault
+                                .put(&key, &format!("{} {}", meta.name, ident.label), &prev.secret)
+                                .context("re-saving the current login")?;
+                            recaptured = Some(ident.clone());
+                        }
+                        Some(_) => {
+                            // Same account. An import marked the saved secret as the one to
+                            // install. Otherwise a different live file is a newer refresh:
+                            // keep that blob in the vault and write it back, so verify cannot
+                            // accept a stale saved token over the file.
+                            let keep_saved = self.state().install_saved.contains(&target.vault_key());
+                            if !keep_saved && prev.secret.as_bytes() != install.as_bytes() {
                                 self.vault
-                                    .put(&key, &format!("{} {}", meta.name, ident.label), &prev.secret)
+                                    .put(
+                                        &target.vault_key(),
+                                        &format!("{} {}", meta.name, target.label),
+                                        &prev.secret,
+                                    )
                                     .context("re-saving the current login")?;
-                                recaptured = Some(ident.clone());
+                                install = prev.secret.clone();
                             }
                         }
                         None => warnings.push(Warning::info(
@@ -310,7 +332,7 @@ impl Core {
                         )),
                     }
                 }
-                p.activate(&self.cx, &secret, &target.identity)
+                p.activate(&self.cx, &install, &target.identity)
                     .with_context(|| format!("writing {} credentials", meta.name))?;
                 match p.verify(&self.cx, &target.identity) {
                     Ok(true) => {}
@@ -333,6 +355,7 @@ impl Core {
         }
 
         let mut st = self.state();
+        st.install_saved.remove(&target.vault_key());
         if let Some(prev) = &recaptured {
             st.upsert(
                 Account {
@@ -387,6 +410,7 @@ impl Core {
         }
         let mut st = self.state();
         st.remove(meta.id, &acct.id);
+        st.install_saved.remove(&acct.vault_key());
         self.persist(&mut st, "account.removed", Some(meta.id), Some(&acct.id))?;
         Ok(acct)
     }
@@ -420,7 +444,7 @@ impl Core {
             // touch the live slot, so put that provider's previous cache entry back.
             let id = p.meta().id;
             let cached = self.state().live_cache.get(id).cloned();
-            let account = self.store_account(p, identity, &captured.secret, label)?;
+            let account = self.store_account(p, identity, &captured.secret, label, true)?;
             let mut st = self.state();
             match cached {
                 Some(entry) => {
@@ -729,6 +753,7 @@ mod tests {
 
         let saved = core.login_here("mock", None).unwrap();
         assert_eq!(saved.account.id, "a@x.io");
+        assert!(core.state().install_saved.contains("mock:a@x.io"));
         let live: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(live["token"], "t-old");
         assert_eq!(live["theme"], "dark");
@@ -741,6 +766,7 @@ mod tests {
         assert_eq!(slot["user"], "a@x.io");
 
         core.use_account("mock", "a@x.io").unwrap();
+        assert!(!core.state().install_saved.contains("mock:a@x.io"));
         let live: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(live["token"], "t-new");
         assert_eq!(live["user"], "a@x.io");
@@ -759,6 +785,32 @@ mod tests {
         let raw = base64::engine::general_purpose::STANDARD.decode(stored["slots"][0].as_str().unwrap()).unwrap();
         let slot: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(slot["token"], "t-new");
+    }
+
+    #[test]
+    fn use_of_same_account_keeps_a_newer_live_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = core(dir.path());
+        core.detect_cache.lock().unwrap().insert("mock", Some(Installed { path: "/bin/mock".into(), version: None }));
+        let file = dir.path().join("mock.json");
+        std::fs::write(&file, r#"{"token":"t-old","user":"a@x.io","theme":"dark"}"#).unwrap();
+        core.save("mock", None).unwrap();
+        assert!(!core.state().install_saved.contains("mock:a@x.io"));
+
+        // The CLI refreshed this account after the save. `use` must not put the stale vault copy back.
+        std::fs::write(&file, r#"{"token":"t-new","user":"a@x.io","theme":"dark"}"#).unwrap();
+        core.use_account("mock", "a@x.io").unwrap();
+        let live: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(live["token"], "t-new");
+        let blob = core.vault.get("mock:a@x.io").unwrap().unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(blob.as_bytes()).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD.decode(stored["slots"][0].as_str().unwrap()).unwrap();
+        let slot: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(slot["token"], "t-new");
+
+        core.use_account("mock", "a@x.io").unwrap();
+        let live: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(live["token"], "t-new");
     }
 
     #[test]
