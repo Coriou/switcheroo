@@ -24,7 +24,8 @@ impl Slot for KeychainItemSlot {
         find_generic_password(&self.service, &self.account)
     }
     fn write(&self, data: &[u8]) -> Result<()> {
-        add_generic_password(&self.service, &self.account, &self.service, data)
+        add_generic_password(&self.service, &self.account, &self.service, data)?;
+        Ok(())
     }
     fn clear(&self) -> Result<()> {
         delete_generic_password(&self.service, &self.account)
