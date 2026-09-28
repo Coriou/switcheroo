@@ -74,7 +74,7 @@ Everything is a `switcheroo` subcommand with `--json` output, so it scripts well
 
 ## Updates
 
-`switcheroo update` fetches the latest release for your platform, verifies it against the release's `SHA256SUMS`, replaces the binary in place and restarts the tray if it was running. `switcheroo update --check` only reports. The CLI, the web UI and the tray all point out a newer release until it is installed.
+`switcheroo update` fetches the latest release for your platform, verifies it against the release's `SHA256SUMS`, replaces the binary in place and restarts the tray if it was running. `switcheroo update --check` only reports. The CLI, the web UI and the tray all point out a newer release until it is installed. This fork will not replace its binary unless `SWITCHEROO_ALLOW_UPSTREAM_UPDATE=1` is set.
 
 ## How a switch works
 1. Acquire an exclusive lock so a terminal command and the tray never interleave.
