@@ -149,6 +149,18 @@ pub fn download_and_install(version: &str) -> Result<Installed> {
     Ok(Installed { version: version.to_string(), path: exe })
 }
 
+/// Only the exact opt-in `1` lets this fork replace its binary from GitHub.
+pub fn upstream_install_allowed(flag: Option<&str>) -> bool {
+    flag == Some("1")
+}
+
+/// This fork does not install an upstream release unless that opt-in is set.
+pub fn refuse_upstream_install() -> Result<()> {
+    bail!(
+        "This build does not replace itself from GitHub. Set SWITCHEROO_ALLOW_UPSTREAM_UPDATE=1 to install the FTCHD/switcheroo release over this binary."
+    )
+}
+
 /// Start the new binary with this process's arguments and never return.
 pub fn relaunch() -> ! {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("switcheroo"));
@@ -216,6 +228,10 @@ impl Core {
 
     /// Install the latest release over this binary. The caller decides how to relaunch.
     pub fn install_update(&self) -> Result<Installed> {
+        let flag = std::env::var("SWITCHEROO_ALLOW_UPSTREAM_UPDATE").ok();
+        if !upstream_install_allowed(flag.as_deref()) {
+            refuse_upstream_install()?;
+        }
         let info = self.update_status(true)?;
         if !info.available {
             bail!("already up to date (v{CURRENT})");
@@ -268,5 +284,20 @@ mod tests {
     #[test]
     fn this_platform_has_an_asset() {
         assert!(asset_name().is_some());
+    }
+
+    #[test]
+    fn install_is_refused_without_an_explicit_opt_in() {
+        let err = refuse_upstream_install().unwrap_err();
+        assert!(err.to_string().contains("SWITCHEROO_ALLOW_UPSTREAM_UPDATE"));
+    }
+
+    #[test]
+    fn upstream_install_allowed_only_for_the_exact_opt_in() {
+        assert!(upstream_install_allowed(Some("1")));
+        assert!(!upstream_install_allowed(None));
+        assert!(!upstream_install_allowed(Some("true")));
+        assert!(!upstream_install_allowed(Some("yes")));
+        assert!(!upstream_install_allowed(Some("")));
     }
 }
