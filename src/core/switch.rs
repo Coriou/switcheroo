@@ -14,6 +14,15 @@ use super::terminal;
 use super::{Core, Strategy};
 use crate::providers::Provider;
 
+/// `login` returns the saved account (flattened in JSON) plus an optional note.
+#[derive(Debug, Serialize)]
+pub struct LoginResult {
+    #[serde(flatten)]
+    pub account: Account,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// `use`/`save` can fail for reasons the user must fix; these map to distinct exit codes.
 #[derive(Debug, thiserror::Error)]
 pub enum OpError {
@@ -150,23 +159,7 @@ impl Core {
             }
             Strategy::SlotSwap => {
                 let captured = p.capture(&self.cx)?.ok_or_else(|| OpError::NothingLoggedIn(meta.name.to_string()))?;
-                let identity = match (captured.identity, &label) {
-                    (Some(i), _) => i,
-                    (None, Some(l)) => Identity::new(l.clone()),
-                    (None, None) => match captured.identity_error {
-                        Some(e) => bail!(
-                            "could not determine who is logged in to {} ({}); run `switcheroo save {} --label <name>` to save it anyway",
-                            meta.name,
-                            e,
-                            meta.id
-                        ),
-                        None => bail!(
-                            "{} does not record who is logged in; run `switcheroo save {} --label <name>`",
-                            meta.name,
-                            meta.id
-                        ),
-                    },
-                };
+                let identity = saved_identity(meta, captured.identity, captured.identity_error, &label)?;
                 self.store_account(p, identity, &captured.secret, label)
             }
         }
@@ -403,9 +396,35 @@ impl Core {
     }
 
     /// Run the CLI's login in this terminal, then save the result.
-    pub fn login_here(&self, provider_id: &str, label: Option<String>) -> Result<Account> {
+    pub fn login_here(&self, provider_id: &str, label: Option<String>) -> Result<LoginResult> {
         let p = self.provider(provider_id)?;
         self.require_installed(p)?;
+        if let Some(captured) = p.import_login(&self.cx)? {
+            let _lock = self.lock()?;
+            let identity = saved_identity(p.meta(), captured.identity, captured.identity_error, &label)?;
+            // store_account records the saved identity as the live login. This import did not
+            // touch the live slot, so put that provider's previous cache entry back.
+            let id = p.meta().id;
+            let cached = self.state().live_cache.get(id).cloned();
+            let account = self.store_account(p, identity, &captured.secret, label)?;
+            let mut st = self.state();
+            match cached {
+                Some(entry) => {
+                    st.live_cache.insert(id.to_string(), entry);
+                }
+                None => {
+                    st.live_cache.remove(id);
+                }
+            }
+            self.persist(&mut st, "state.changed", Some(id), None)?;
+            let note = format!(
+                "Left the current {} login in place. Quit it, then switch with `switcheroo use {} {}`.",
+                p.meta().name,
+                p.meta().id,
+                account.id
+            );
+            return Ok(LoginResult { account, note: Some(note) });
+        }
         let argv = p.login_command(&self.cx);
         if argv.is_empty() {
             bail!(
@@ -418,7 +437,7 @@ impl Core {
         if code != 0 {
             bail!("`{}` exited with status {}", argv.join(" "), code);
         }
-        self.save(provider_id, label)
+        Ok(LoginResult { account: self.save(provider_id, label)?, note: None })
     }
 
     /// Open a terminal window running `switcheroo login <provider>`.
@@ -446,6 +465,31 @@ impl Core {
     }
 }
 
+fn saved_identity(
+    meta: &crate::providers::ProviderMeta,
+    identity: Option<Identity>,
+    identity_error: Option<String>,
+    label: &Option<String>,
+) -> Result<Identity> {
+    match (identity, label) {
+        (Some(i), _) => Ok(i),
+        (None, Some(l)) => Ok(Identity::new(l.clone())),
+        (None, None) => match identity_error {
+            Some(e) => bail!(
+                "could not determine who is logged in to {} ({}); run `switcheroo save {} --label <name>` to save it anyway",
+                meta.name,
+                e,
+                meta.id
+            ),
+            None => bail!(
+                "{} does not record who is logged in; run `switcheroo save {} --label <name>`",
+                meta.name,
+                meta.id
+            ),
+        },
+    }
+}
+
 fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-:\\".contains(c)) {
         s.to_string()
@@ -463,6 +507,7 @@ mod tests {
     use crate::core::settings::VaultChoice;
     use crate::core::{CoreOpts, Cx};
     use crate::providers::slot_provider::testing::json_file_provider;
+    use base64::Engine;
 
     fn core(dir: &std::path::Path) -> std::sync::Arc<Core> {
         let cx = Cx::test(dir, Os::Linux);
@@ -491,6 +536,7 @@ mod tests {
         let a = core.save("mock", Some("Work".into())).unwrap();
         assert_eq!(a.id, "a@x.io");
         assert_eq!(a.label, "Work");
+        assert_eq!(core.state().live_cache.get("mock").unwrap().identity.as_ref().unwrap().id, "a@x.io");
 
         // User logs in as B with the CLI; Switcheroo has never seen B.
         std::fs::write(&file, r#"{"token":"t-b","user":"b@x.io","theme":"dark"}"#).unwrap();
@@ -538,5 +584,89 @@ mod tests {
         assert_eq!(core.resolve_account(p, "TWO@X.IO").unwrap().id, "two@x.io");
         core.rename("mock", "one", "Personal").unwrap();
         assert_eq!(core.resolve_account(p, "personal").unwrap().id, "one@x.io");
+    }
+
+    #[test]
+    fn import_login_saves_the_new_account_without_taking_over_the_live_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = json_file_provider();
+        provider.import_login = Some(|_cx| Ok(br#"{"token":"t-b","user":"b@x.io","theme":"dark"}"#.to_vec()));
+        let core = Core::open(CoreOpts {
+            data_dir: Some(dir.path().join("data")),
+            vault: Some(VaultChoice::File),
+            cx: Some(Cx::test(dir.path(), Os::Linux)),
+            providers: Some(vec![Box::new(provider)]),
+        })
+        .unwrap();
+        core.detect_cache.lock().unwrap().insert("mock", Some(Installed { path: "/bin/mock".into(), version: None }));
+
+        let file = dir.path().join("mock.json");
+        std::fs::write(&file, r#"{"token":"t-a","user":"a@x.io","theme":"dark"}"#).unwrap();
+        let p = core.provider("mock").unwrap();
+        let before = core.status(p, false);
+        assert_eq!(before.live.as_ref().unwrap().id, "a@x.io");
+        let cached_before = core.state().live_cache.get("mock").cloned().unwrap();
+
+        let saved = core.login_here("mock", None).unwrap();
+        assert_eq!(saved.account.id, "b@x.io");
+        assert_eq!(
+            saved.note.as_deref(),
+            Some("Left the current Mock CLI login in place. Quit it, then switch with `switcheroo use mock b@x.io`.")
+        );
+        let json = serde_json::to_value(&saved).unwrap();
+        assert_eq!(json["id"], "b@x.io");
+        assert!(json.get("account").is_none(), "account fields stay flattened");
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"token":"t-a","user":"a@x.io","theme":"dark"}"#);
+        let after = core.status(p, false);
+        assert_eq!(after.live.as_ref().unwrap().id, "a@x.io");
+        let cached_after = core.state().live_cache.get("mock").cloned().unwrap();
+        assert_eq!(cached_after.identity.as_ref().unwrap().id, "a@x.io");
+        assert_eq!(cached_after.fingerprint, cached_before.fingerprint);
+        assert_eq!(cached_after.at, cached_before.at);
+        let disk = crate::core::state::State::load(&core.dirs.state_file()).unwrap();
+        assert_eq!(disk.live_cache.get("mock").unwrap().identity.as_ref().unwrap().id, "a@x.io");
+
+        let blob = core.vault.get("mock:b@x.io").unwrap().expect("vault holds B");
+        let stored: serde_json::Value = serde_json::from_slice(blob.as_bytes()).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD.decode(stored["slots"][0].as_str().unwrap()).unwrap();
+        let slot: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(slot["token"], "t-b");
+        assert_eq!(slot["user"], "b@x.io");
+        assert!(core.vault.get("mock:a@x.io").unwrap().is_none());
+    }
+
+    #[test]
+    fn import_login_does_not_invent_a_live_cache_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = json_file_provider();
+        provider.import_login = Some(|_cx| Ok(br#"{"token":"t-b","user":"b@x.io"}"#.to_vec()));
+        let core = Core::open(CoreOpts {
+            data_dir: Some(dir.path().join("data")),
+            vault: Some(VaultChoice::File),
+            cx: Some(Cx::test(dir.path(), Os::Linux)),
+            providers: Some(vec![Box::new(provider)]),
+        })
+        .unwrap();
+        core.detect_cache.lock().unwrap().insert("mock", Some(Installed { path: "/bin/mock".into(), version: None }));
+        let file = dir.path().join("mock.json");
+        std::fs::write(&file, r#"{"token":"t-a","user":"a@x.io"}"#).unwrap();
+        assert!(core.state().live_cache.get("mock").is_none());
+
+        let saved = core.login_here("mock", None).unwrap();
+        assert_eq!(saved.account.id, "b@x.io");
+        assert!(core.state().live_cache.get("mock").is_none());
+        let disk = crate::core::state::State::load(&core.dirs.state_file()).unwrap();
+        assert!(disk.live_cache.get("mock").is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"token":"t-a","user":"a@x.io"}"#);
+
+        let st = core.status(core.provider("mock").unwrap(), false);
+        assert_eq!(st.live.as_ref().unwrap().id, "a@x.io");
+        let blob = core.vault.get("mock:b@x.io").unwrap().expect("vault holds B");
+        let stored: serde_json::Value = serde_json::from_slice(blob.as_bytes()).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD.decode(stored["slots"][0].as_str().unwrap()).unwrap();
+        let slot: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(slot["user"], "b@x.io");
+        assert_eq!(slot["token"], "t-b");
     }
 }
